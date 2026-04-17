@@ -1,0 +1,9 @@
+playwright_session/
+downloads/
+sorted/
+debug/
+*.tmp
+__pycache__/
+*.pyc
+.venv/
+venv/
