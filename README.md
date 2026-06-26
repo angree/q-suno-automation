@@ -12,6 +12,10 @@ Built with [Playwright](https://playwright.dev/python/) driving a real Chrome br
 - **Interactive prompts** — pick your CSV, choose a row range (e.g. `1-50`), optionally append extra style tags to every prompt.
 - **Persistent login** — log in to Suno once via Google/Discord/email; the session is saved to disk for all future runs.
 - **Auto-retry on lost submits** — if a Create click doesn't register (no credits spent), the script retries up to `--max-retries` times before moving on.
+- **Captcha-aware** — detects Cloudflare Turnstile / hCaptcha challenges, beeps and speaks an alert, and waits for you to solve it before continuing (no credits wasted).
+- **Multiple accounts** — store several logins side by side and switch with `--account NAME`. Each is a separate Chrome profile with its own port, so you can run them back-to-back to spend each account's daily credits.
+- **Retro-game style preset** — `--style-suffix-preset retro` prepends a proven "8-bit / famicom" prefix that nudges Suno toward game-OST character.
+- **Cross-platform** — Windows, macOS and Linux (auto-detects the Chrome executable; override with `CHROME_PATH`).
 - **Debug dumps on failure** — every error saves a full HTML + screenshot to `debug/` for troubleshooting selector changes.
 
 ## Requirements
@@ -78,6 +82,28 @@ The script will:
 
 Output MP3s land in `downloads/` by default.
 
+### Multiple accounts (optional)
+
+Store several Suno logins side by side and run them in turn to spend each account's daily credits. Each account is a separate Chrome profile with its own DevTools port, so they never clash.
+
+```bash
+# log a second account in once (own browser profile)
+python suno_automation.py --login-only --use-system-chrome --account second
+
+# generate on each account (the original is "default" — no flag needed)
+python suno_automation.py --use-system-chrome --csv example_songs.csv          # default account
+python suno_automation.py --use-system-chrome --account second --csv example_songs.csv
+
+# see what's stored
+python suno_automation.py --list-accounts
+```
+
+Daily free credits are counted **per Suno account**, so two accounts = two daily pools.
+
+### Captchas
+
+Suno occasionally fronts Create with a Cloudflare Turnstile / hCaptcha challenge. The script detects it, beeps + speaks an alert, and waits (up to `--captcha-wait` seconds) for you to solve it in the open browser — then continues. No credits are spent while it waits. Use `--no-tts` to silence the spoken alert.
+
 ## CLI Reference
 
 | Flag | Description |
@@ -94,9 +120,17 @@ Output MP3s land in `downloads/` by default.
 | `--stop-on-error` | Halt on first failure. Leaves browser open for inspection. |
 | `--max-retries N` | Retry a row up to N times if Create click doesn't submit (default: 2). Only retries when no credits were spent. |
 | `--style-suffix TEXT` | Extra style tags appended to every row at generation time (CSV is not modified). |
-| `--no-ask-suffix` | Skip the interactive style-suffix prompt. |
+| `--style-suffix-preset retro` | Prepend the built-in retro-game prefix (8-bit / famicom) to every row. |
+| `--style-suffix-position before\|after` | Place `--style-suffix` before or after the CSV styles (default: after). |
+| `--no-ask-suffix` | Skip the interactive style-suffix / filename-suffix prompts. |
+| `--file-suffix TEXT` | Append text to every saved filename (e.g. the Suno version `v5`). Bookkeeping only — never triggers a regeneration. |
+| `--account NAME` | Use a named login profile (separate Chrome session + derived port). Omit for the `default` account. |
+| `--list-accounts` | List stored account profiles with their ports, then exit. |
+| `--captcha-wait N` | Max seconds to wait for you to solve a captcha after Create (default: 600). |
+| `--no-tts` | Disable the spoken captcha alert (terminal beep stays). |
+| `--page-timeout MS` | Default Playwright action/navigation timeout in ms for a slow Suno UI (default: 90000). |
 | `--delay N` | Seconds to wait between rows (default: 30). |
-| `--gen-timeout N` | Per-song generation timeout in seconds (default: 300). |
+| `--gen-timeout N` | Per-song generation timeout in seconds (default: 720). |
 | `--min-wait-after-click N` | Seconds to wait after clicking Create before polling for new clips (default: 15). |
 | `--cdp-port N` | Chrome DevTools Protocol port (default: 9222). Change if another Chrome instance uses it. |
 | `--headless` | Run headless. Not recommended — Suno may block headless browsers. |
@@ -139,6 +173,7 @@ After each row, the CSV is updated with `status=done` or `status=failed`.
 | Problem | Solution |
 |---------|----------|
 | Google login hangs on spinning bar | Use `--use-system-chrome`. Playwright's Chromium is blocked by Google. |
+| A captcha appears and the run pauses | Expected — solve the Cloudflare/hCaptcha in the browser; the script resumes automatically (no credits spent while waiting). |
 | "Chrome not found" error | Install Chrome, or set `CHROME_PATH=/path/to/chrome`. |
 | Port 9222 conflict | Add `--cdp-port 9333`. |
 | "No visible Create button" | Suno may have updated their UI. Check `debug/*.html` for the current DOM. |
@@ -152,6 +187,17 @@ After each row, the CSV is updated with `status=done` or `status=failed`.
 - **2 clips per generation** — Suno always produces 2 variants per Create click. Both are downloaded.
 - **CDN quality** — downloads are streaming-quality MP3s from Suno's CDN. For higher quality, use Suno's UI Download menu (the script attempts this as a fallback if CDN fails).
 - **Rate limits** — Suno may silently drop a Create request under heavy load. The script detects this (no new clips appear) and retries safely.
+
+## Helper scripts (Windows)
+
+Optional `.bat` wrappers for the multi-account workflow (edit the account names / CSV at the top of each):
+
+| Script | What it does |
+|--------|--------------|
+| `suno_account_login.bat [name]` | Log a named account in (Enter = the `default` account). |
+| `suno_account_run.bat [name] [args]` | Generate on a named account (Enter = `default`); extra args are forwarded. |
+| `suno_account_logout.bat <name>` | Delete a stored account profile (asks for confirmation). |
+| `suno_run_both.bat [args]` | Run two accounts back-to-back (set `ACC1`/`ACC2`/`DEFAULT_CSV` at the top) to spend both daily credit pools in one click. |
 
 ## License
 

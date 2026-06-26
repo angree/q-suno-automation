@@ -1,19 +1,17 @@
 """Suno.com song generation automation via Playwright.
 
-Reads a CSV file with columns (n, lyrics, styles, title) and for each row:
-  1. Opens suno.com/create in Advanced mode.
-  2. Fills the Lyrics, Styles, and Title fields.
-  3. Clicks Create and waits for generation to complete.
-  4. Downloads the produced MP3 clips via Suno's CDN.
+Reads a CSV of (lyrics, styles, title) rows, drives suno.com/create in
+Custom Mode, waits for each generation, downloads the produced audio,
+and marks progress back into the CSV so interrupted runs resume.
 
-Session is persisted via Chrome's user-data-dir, so you log in once and
-subsequent runs reuse the saved cookies. Progress is tracked via a
-'status' column in the CSV — interrupted runs resume where they left off.
+First run is headed so the user can log in; the session is persisted via
+Playwright's user_data_dir, so subsequent runs reuse cookies/storage.
 
-Works on Windows, macOS, and Linux. Requires a real Chrome (or Edge)
-install — Playwright's bundled Chromium is blocked by Google OAuth.
+Selectors for the Suno composer are intentionally left as NotImplementedError
+stubs — Suno's DOM changes, and guessed selectors are a liability. Fill them
+in after running:
 
-See README.md for full usage instructions.
+    python -m playwright codegen https://suno.com/create
 """
 
 from __future__ import annotations
@@ -49,16 +47,35 @@ SUNO_BASE = "https://suno.com"
 CREATE_URL = f"{SUNO_BASE}/create"
 
 DEFAULT_CSV = Path("songs.csv")
-DEFAULT_SESSION_DIR = Path("playwright_session")
+# Chrome's user-data-dir MUST live on a fast LOCAL disk, never a network share.
+# Chrome hammers the profile with tiny reads/writes (cookies, IndexedDB,
+# service-worker + GPU caches); over SMB/NAS that makes a heavy SPA like Suno
+# crawl. This repo sits on a mapped NAS drive, so default the profile to local.
+if sys.platform == "win32":
+    _LOCAL_BASE = Path(os.environ.get("LOCALAPPDATA") or Path.home())
+else:
+    _LOCAL_BASE = Path.home()
+DEFAULT_SESSION_BASE = _LOCAL_BASE / "suno_automation"
+# Each Suno account gets its own Chrome profile dir under DEFAULT_SESSION_BASE so
+# multiple logins are stored side by side (see --account). The unnamed "default"
+# account keeps the original path, so existing logins keep working untouched.
+DEFAULT_SESSION_DIR = DEFAULT_SESSION_BASE / "playwright_session"
 DEFAULT_DOWNLOAD_DIR = Path("downloads")
 DEFAULT_DELAY_S = 30
-DEFAULT_GEN_TIMEOUT_S = 300  # 5 min per song
+DEFAULT_GEN_TIMEOUT_S = 720  # 12 min per phase (Suno can lag; 8-min songs need room)
 DEFAULT_CDP_PORT = 9222
 DEFAULT_MIN_WAIT_AFTER_CLICK_S = 15
+DEFAULT_PAGE_TIMEOUT_MS = 90000  # default action + navigation timeout (Suno can lag)
+DEFAULT_CAPTCHA_WAIT_S = 600  # max seconds to wait for the user to solve a captcha
 DEBUG_DIR = Path("debug")
 
-# Common Chrome install locations — platform-adaptive.
-_CHROME_PATHS: tuple[str, ...] = ()
+# Runtime-mutable copy of the above, set from --page-timeout by configure_timeouts().
+# Functions without access to argparse (open_create, switch_to_advanced_mode,
+# click_create, ensure_logged_in) read this for their explicit waits.
+PAGE_TIMEOUT_MS = DEFAULT_PAGE_TIMEOUT_MS
+
+# Common Chrome install locations per OS — checked in order. Cross-platform so
+# the same script runs on Windows, macOS and Linux; PATH lookup is the fallback.
 if sys.platform == "win32":
     _CHROME_PATHS = (
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -68,8 +85,9 @@ if sys.platform == "win32":
 elif sys.platform == "darwin":
     _CHROME_PATHS = (
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
     )
-else:  # Linux and others
+else:
     _CHROME_PATHS = (
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
@@ -81,6 +99,7 @@ else:  # Linux and others
 STATUS_COL = "status"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
+STATUS_SKIP = "skip"  # manually handled (downloaded by user) — never process or reconcile
 
 ORDINAL_COL = "n"
 REQUIRED_COLS = ("lyrics", "styles", "title")
@@ -166,21 +185,84 @@ def ask_range_interactively(total_rows: int) -> tuple[Optional[int], Optional[in
     return start, end
 
 
-def ask_style_suffix_interactively() -> str:
-    """Prompt for extra STYLE TAGS appended to every row's Suno 'Styles' field.
+RETRO_GAME_PRESET = (
+    "8-bit music, low frequency samples, old computer feel, "
+    "famicom retro gaming samples"
+)
 
-    NOT a filename suffix. This text is typed into Suno's Styles input
-    alongside the CSV's existing styles, applied only in memory (CSV is
-    never modified).
+
+def ask_style_suffix_interactively() -> tuple[str, str]:
+    """Interactive 3-option menu for the extra style tags merged into Suno's
+    'Styles' field. NOT a filename suffix — CSV file is never modified.
+
+    The "retro" preset is a magic-prefix discovery from listening: prepending
+    these tags pushes Suno away from polished pop production toward game-OST
+    feel even when the underlying genre tags aren't retro at all.
+
+    Returns (text, position) where position is "before" or "after"; empty
+    text means no tags will be added.
     """
     print()
-    print("Extra STYLE TAGS to append to the Suno 'Styles' field for every row.")
-    print("(This goes into the music prompt, NOT the saved filename.)")
-    print("  e.g.   long song, 3 minute length, extended outro")
-    print("         lofi production, tape warmth")
-    print("  Leave blank = append nothing (recommended for curated CSVs).")
+    print("Extra STYLE TAGS to merge into the Suno 'Styles' field for every row.")
+    print("(NOT a filename suffix. CSV file is never modified.)")
+    print()
+    print("  [r]      retro-game preset (PREPENDED to CSV styles):")
+    print(f'           "{RETRO_GAME_PRESET}"')
+    print("  [t]      type your own — will ask before/after the CSV styles")
+    print("  [Enter]  no extra tags (default)")
+    while True:
+        choice = input("> choice: ").strip().lower()
+        if choice == "":
+            return "", "after"
+        if choice in ("r", "retro", "retro-game", "preset"):
+            return RETRO_GAME_PRESET, "before"
+        if choice in ("t", "type", "custom"):
+            break
+        print("  please enter 'r', 't', or just press Enter")
+    print()
     raw = input("> extra style tags: ").strip()
-    return raw
+    if not raw:
+        return "", "after"
+    while True:
+        ans = input("> place BEFORE (b) or AFTER (a) the CSV styles? [a]: ").strip().lower()
+        if ans in ("", "a", "after"):
+            return raw, "after"
+        if ans in ("b", "before"):
+            return raw, "before"
+        print("  please enter 'a' (after) or 'b' (before)")
+
+
+def sanitize_file_suffix(raw: str) -> str:
+    """Make a string safe to embed in a filename: keep letters/digits/dot/dash,
+    turn spaces and underscores into dashes, drop everything else, collapse
+    repeated dashes. E.g. 'Suno v4.5' -> 'Suno-v4.5'."""
+    out = []
+    for c in (raw or "").strip():
+        if c.isalnum() or c in ".-":
+            out.append(c)
+        elif c in " _":
+            out.append("-")
+    s = "".join(out).strip("-.")
+    while "--" in s:
+        s = s.replace("--", "-")
+    return s
+
+
+def ask_file_suffix_interactively() -> str:
+    """Ask for a text suffix appended to EVERY downloaded filename — e.g. the
+    Suno model version used for this run ('v5', 'v4.5'). Empty = none.
+
+    Appended AFTER the id: '<n>_<title>_<variant>_<uuid8>_<suffix>.mp3'.
+    Bookkeeping only — resume/reconcile match the '<n>_<title>_' prefix, so a
+    suffix never triggers a regeneration (no wasted credits)."""
+    print()
+    print("Filename SUFFIX added to every saved file (e.g. the Suno version: v5, v4.5).")
+    print("Lands after the id:  0001_Title_0_ab12cd34_v5.mp3   —   [Enter] = none.")
+    raw = input("> filename suffix: ").strip()
+    s = sanitize_file_suffix(raw)
+    if raw and s != raw:
+        print(f"  (using filename-safe form: {s!r})")
+    return s
 
 
 def load_rows(csv_path: Path) -> tuple[list[Row], list[str]]:
@@ -249,7 +331,7 @@ def write_rows(csv_path: Path, rows: list[Row], fieldnames: list[str]) -> None:
 
 
 def pending(rows: Iterable[Row]) -> list[Row]:
-    return [r for r in rows if r.status != STATUS_DONE]
+    return [r for r in rows if r.status not in (STATUS_DONE, STATUS_SKIP)]
 
 
 # -----------------------------------------------------------------------------
@@ -263,13 +345,14 @@ def _find_chrome_exe() -> Path:
     for p in _CHROME_PATHS:
         if p and Path(p).is_file():
             return Path(p)
-    for name in ("chrome", "chrome.exe", "google-chrome"):
+    for name in ("chrome", "chrome.exe", "google-chrome",
+                 "google-chrome-stable", "chromium", "chromium-browser"):
         found = shutil.which(name)
         if found:
             return Path(found)
     raise RuntimeError(
         "Chrome not found. Install Chrome from https://google.com/chrome, "
-        "or set the CHROME_PATH env var to point at chrome.exe."
+        "or set the CHROME_PATH env var to point at the Chrome executable."
     )
 
 
@@ -369,6 +452,24 @@ def acquire_context(
     return ctx, cleanup_launched
 
 
+def configure_timeouts(ctx: BrowserContext, page: Page, timeout_ms: int) -> None:
+    """Raise Playwright's default action + navigation timeouts for a slow Suno UI.
+
+    Sets the context AND page defaults (covers every implicit locator / fill /
+    goto wait) plus the module-level PAGE_TIMEOUT_MS that the explicit waits read
+    (Advanced tab, Create-button discovery, login navigation).
+    """
+    global PAGE_TIMEOUT_MS
+    PAGE_TIMEOUT_MS = max(int(timeout_ms), 1000)
+    for target in (ctx, page):
+        try:
+            target.set_default_timeout(PAGE_TIMEOUT_MS)
+            target.set_default_navigation_timeout(PAGE_TIMEOUT_MS)
+        except Exception:
+            pass
+    log.info("Page timeouts set to %d ms (action + navigation).", PAGE_TIMEOUT_MS)
+
+
 def launch_context(
     pw: Playwright,
     session_dir: Path,
@@ -419,7 +520,7 @@ def _on_create_page(page: Page) -> bool:
 def ensure_logged_in(page: Page, interactive: bool = True) -> None:
     """Navigate to /create; if we got redirected away, walk the user through login."""
     try:
-        page.goto(CREATE_URL, wait_until="domcontentloaded", timeout=30000)
+        page.goto(CREATE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     except PlaywrightTimeoutError:
         pass  # SPA may still be resolving auth; we'll check URL below.
 
@@ -446,7 +547,7 @@ def ensure_logged_in(page: Page, interactive: bool = True) -> None:
     if not _on_create_page(page):
         # Last-ditch: try a clean navigation now that OAuth should be done.
         try:
-            page.goto(CREATE_URL, wait_until="domcontentloaded", timeout=30000)
+            page.goto(CREATE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
         except PlaywrightTimeoutError:
             pass
         page.wait_for_timeout(2000)
@@ -497,7 +598,7 @@ def dump_page_state(page: Page, label: str) -> Optional[Path]:
 
 
 def open_create(page: Page) -> None:
-    page.goto(CREATE_URL, wait_until="domcontentloaded")
+    page.goto(CREATE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     _dismiss_cookies(page)
 
 
@@ -518,10 +619,50 @@ def switch_to_advanced_mode(page: Page) -> None:
     Suno renamed what used to be 'Custom Mode' to 'Advanced' — one of the
     three pill tabs at the top of the composer (Simple / Advanced / Sounds).
     Clicking when already active is a no-op.
+
+    Suno's SPA can be slow to render the composer, so we wait for the tab to
+    become visible and retry the click a few times instead of failing on the
+    first miss (the most common slow-page symptom).
     """
-    page.get_by_role("button", name="Advanced", exact=True).first.click(timeout=10000)
-    # Let the Advanced sections expand before we try to fill them.
-    page.wait_for_timeout(500)
+    # Confirmed DOM: <button aria-label="Advanced">. Target the VISIBLE one
+    # (Suno renders a desktop/mobile duplicate; the role-name locator could
+    # resolve to a hidden copy and hang).
+    btn = page.locator('button[aria-label="Advanced"]:visible').first
+    last_err: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            btn.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+            btn.click(timeout=PAGE_TIMEOUT_MS)
+            page.wait_for_timeout(800)  # let the Advanced sections expand
+            return
+        except PlaywrightTimeoutError as e:
+            last_err = e
+            log.warning("  'Advanced' tab not ready (try %d/3) — slow page, waiting...", attempt)
+            page.wait_for_timeout(3000)
+    dump_page_state(page, "advanced_tab_not_found")
+    raise PlaywrightTimeoutError(f"Could not switch to Advanced mode: {last_err}")
+
+
+def _locate_first(page: Page, selectors: list, what: str, timeout_ms: int = 30000):
+    """Return the first selector resolving to a VISIBLE element, polling up to
+    timeout_ms. Suno reshuffles its DOM (placeholders, headings) between UI
+    versions and A/B buckets, so every field is addressed by an ordered list:
+    prefer a stable data-testid, fall back to the legacy placeholder/heading."""
+    deadline = time.time() + timeout_ms / 1000.0
+    while True:
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                if loc.is_visible():
+                    return loc
+            except Exception:
+                pass
+        if time.time() >= deadline:
+            raise PlaywrightTimeoutError(
+                f"{what}: no selector matched a visible element. Tried: {selectors}. "
+                f"Suno's UI likely changed — see debug/*.html and update fill_advanced_fields."
+            )
+        page.wait_for_timeout(300)
 
 
 def fill_advanced_fields(page: Page, *, lyrics: str, styles: str, title: str) -> None:
@@ -534,31 +675,31 @@ def fill_advanced_fields(page: Page, *, lyrics: str, styles: str, title: str) ->
         placeholder, so we scope by the section heading.
       - Title:  input with placeholder 'Song Title (Optional)'.
     """
-    # Lyrics — distinct placeholder, so we can address it directly.
-    lyrics_box = page.get_by_placeholder("Write some lyrics or leave blank for instrumental")
+    # Lyrics — newer UI exposes data-testid="lyrics-textarea"; older builds
+    # used the placeholder. Try the stable testid first.
+    lyrics_box = _locate_first(page, [
+        '[data-testid="lyrics-textarea"]:visible',
+        'textarea[placeholder="Write some lyrics or leave blank for instrumental"]:visible',
+    ], "lyrics field")
     lyrics_box.click()
     lyrics_box.fill(lyrics)
 
-    # Styles — anchor on the leaf element whose text is exactly 'Styles',
-    # then walk up to the nearest ancestor that contains a <textarea>, and
-    # take that textarea. A naive filter like `div:has(:text("Styles"))`
-    # matches the document body (which contains 'Styles' somewhere) and
-    # resolves to the first textbox in the whole page — i.e. the
-    # 'Search workspaces' input on the right rail. This XPath is narrow
-    # enough to lock onto the Styles accordion specifically.
-    styles_box = page.locator(
-        "xpath=//*[normalize-space(text())='Styles']"
-        "/ancestor::*[.//textarea][1]//textarea"
-    ).first
+    # Styles — newer UI wraps the styles textarea in
+    # data-testid="create-form-styles-wrapper" (there's a separate "Exclude
+    # styles" box in there, so skip that one). Legacy fallback: anchor on the
+    # 'Styles' heading and walk up to the nearest ancestor holding a textarea.
+    styles_box = _locate_first(page, [
+        '[data-testid="create-form-styles-wrapper"] textarea:not([placeholder*="Exclude"]):visible',
+        "xpath=//*[normalize-space(text())='Styles']/ancestor::*[.//textarea][1]//textarea",
+    ], "styles field")
     styles_box.click()
     styles_box.fill(styles)
 
-    # Title — Suno renders TWO inputs with the same placeholder (likely a
-    # desktop/mobile layout duplicate; one hidden via CSS). Strict mode
-    # refuses an ambiguous match, so we filter to the visible one.
-    title_box = page.locator(
-        'input[placeholder="Song Title (Optional)"]:visible'
-    ).first
+    # Title — Suno renders TWO inputs with the same placeholder (desktop/mobile
+    # layout duplicate; one hidden via CSS). :visible picks the shown one.
+    title_box = _locate_first(page, [
+        'input[placeholder="Song Title (Optional)"]:visible',
+    ], "title field")
     title_box.scroll_into_view_if_needed()
     title_box.click()
     title_box.fill(title)
@@ -596,7 +737,7 @@ def click_create(page: Page) -> None:
     candidate across all of them.
     """
     strategies = _create_button_strategies(page)
-    deadline = time.time() + 15
+    deadline = time.time() + max(15, PAGE_TIMEOUT_MS // 1000)
     picked_name: Optional[str] = None
     btn = None
 
@@ -793,6 +934,132 @@ def _generating_uuids(page: Page, uuids: list[str]) -> list[str]:
         return list(uuids)  # assume still generating on error
 
 
+# ---------------------------------------------------------------------------
+# CAPTCHA handling — Suno (Cloudflare-fronted) now sometimes throws a
+# challenge AFTER clicking Create, BEFORE the new clips appear. We can't
+# auto-solve it, so detect it and surface a clear prompt until the user does.
+# ---------------------------------------------------------------------------
+_CAPTCHA_SELECTORS = (
+    # Cloudflare Turnstile — most likely given Suno's CF edge.
+    ("Cloudflare Turnstile", 'iframe[src*="challenges.cloudflare.com"]'),
+    ("Cloudflare Turnstile", 'iframe[src*="turnstile"]'),
+    # hCaptcha
+    ("hCaptcha", 'iframe[src*="hcaptcha.com"]'),
+    ("hCaptcha", 'iframe[src*="newassets.hcaptcha.com"]'),
+    # reCAPTCHA
+    ("reCAPTCHA", 'iframe[src*="google.com/recaptcha"]'),
+    ("reCAPTCHA", 'iframe[src*="recaptcha/api"]'),
+    # generic iframe titled "captcha" / "challenge"
+    ("captcha iframe", 'iframe[title*="captcha" i]'),
+    ("captcha iframe", 'iframe[title*="challenge" i]'),
+    # text-based modal fallbacks (when Suno wraps the widget themselves)
+    ("verify modal", '[role="dialog"]:has-text("verify you are human")'),
+    ("verify modal", '[role="dialog"]:has-text("are you a human")'),
+    ("verify modal", '[role="dialog"]:has-text("Complete the challenge")'),
+)
+
+
+def detect_captcha(page: Page) -> Optional[str]:
+    """Return a short label of the captcha widget visible on the page, else None.
+
+    Cheap to call repeatedly (no implicit waits): each candidate is matched by
+    count(), then visibility-checked on the first hits.
+    """
+    for label, selector in _CAPTCHA_SELECTORS:
+        try:
+            loc = page.locator(selector)
+            count = loc.count()
+            if count <= 0:
+                continue
+            for i in range(min(count, 3)):
+                try:
+                    if loc.nth(i).is_visible():
+                        return label
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+# TTS alert so the user notices a captcha when away from the keyboard.
+# Disabled by --no-tts. Best-effort: never raises, never blocks (fire-and-forget).
+TTS_ENABLED = True
+
+
+def _speak(text: str) -> None:
+    """Best-effort spoken alert. Returns immediately; subprocess plays in bg."""
+    if not TTS_ENABLED:
+        return
+    try:
+        if sys.platform == "win32":
+            ps = shutil.which("powershell") or "powershell"
+            quoted = "'" + text.replace("'", "''") + "'"
+            subprocess.Popen(
+                [ps, "-NoProfile", "-NonInteractive", "-Command",
+                 "Add-Type -AssemblyName System.Speech; "
+                 "(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("
+                 + quoted + ")"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        elif sys.platform == "darwin":
+            subprocess.Popen(["say", text],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            for cmd in (["spd-say", text], ["espeak", text]):
+                if shutil.which(cmd[0]):
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                    return
+    except Exception:
+        pass  # never let TTS failure break a run
+
+
+def wait_for_captcha_solve(page: Page, max_wait_s: int = DEFAULT_CAPTCHA_WAIT_S) -> None:
+    """Block until the captcha is dismissed, prompting the user every 60s.
+
+    Beeps the terminal on first detection and every reminder (so a user away
+    from the screen notices). On first detection also dumps page state to
+    debug/ so we can refine the selector if the wrong heuristic matched.
+    Raises PlaywrightTimeoutError if max_wait_s elapses with the widget still
+    visible — the run loop then marks the row failed (credits may be in flux,
+    so we don't auto-retry).
+    """
+    label = detect_captcha(page)
+    if not label:
+        return
+    dump_page_state(page, "captcha_detected")
+    print("\a", end="", flush=True)
+    _speak("Captcha. Solve captcha.")
+    bar = "=" * 64
+    log.warning(bar)
+    log.warning("CAPTCHA WYKRYTA (%s)", label)
+    log.warning("ROZWIAZ ja w otwartej przegladarce Suno.")
+    log.warning("Skrypt czeka — przypomnienie co 60 sekund.")
+    log.warning(bar)
+    started = time.time()
+    last_log = started
+    while True:
+        page.wait_for_timeout(2000)
+        if not detect_captcha(page):
+            elapsed = int(time.time() - started)
+            log.info("CAPTCHA rozwiazana po %ds. Wracam do generacji.", elapsed)
+            page.wait_for_timeout(1500)  # let Suno settle after the dismiss
+            return
+        elapsed = time.time() - started
+        if elapsed > max_wait_s:
+            raise PlaywrightTimeoutError(
+                f"CAPTCHA nie rozwiazana w {max_wait_s}s — przerywam wiersz."
+            )
+        if time.time() - last_log >= 60:
+            print("\a", end="", flush=True)
+            _speak("Captcha. Solve captcha.")
+            log.warning("CAPTCHA wciaz nierozwiazana — rozwiaz w przegladarce (%ds).",
+                        int(time.time() - started))
+            last_log = time.time()
+
+
 def wait_for_generation(
     page: Page,
     pre_top: list[str],
@@ -800,6 +1067,7 @@ def wait_for_generation(
     expect_count: int = 2,
     min_wait_after_click_s: int = DEFAULT_MIN_WAIT_AFTER_CLICK_S,
     expected_title: Optional[str] = None,
+    captcha_wait_s: int = DEFAULT_CAPTCHA_WAIT_S,
 ) -> list[str]:
     """Wait for `expect_count` new clips to appear at the TOP of the workspace.
 
@@ -819,13 +1087,20 @@ def wait_for_generation(
     If `expected_title` is given, log a warning if the rendered title of
     the new rows doesn't match — useful when debugging mis-picked rows.
     """
-    # Phase 0: fixed wait before we trust the DOM.
+    # Phase 0: settle wait, but actively watch for Suno's post-Create captcha.
+    # If a captcha widget appears, block (with a user prompt) until solved,
+    # then restart the settle so the workspace has time to insert new rows.
     if min_wait_after_click_s > 0:
         log.info(
             "  waiting %ds after Create click for Suno to insert new rows...",
             min_wait_after_click_s,
         )
-        page.wait_for_timeout(min_wait_after_click_s * 1000)
+        end = time.time() + min_wait_after_click_s
+        while time.time() < end:
+            if detect_captcha(page):
+                wait_for_captcha_solve(page, max_wait_s=captcha_wait_s)
+                end = time.time() + min_wait_after_click_s
+            page.wait_for_timeout(1000)
 
     _scroll_workspace_to_top(page)
 
@@ -834,6 +1109,8 @@ def wait_for_generation(
     new_uuids: list[str] = []
     # Phase 1: poll until top positions are populated with uuids not in pre_top.
     while time.time() < deadline:
+        if detect_captcha(page):
+            wait_for_captcha_solve(page, max_wait_s=captcha_wait_s)
         current_top = get_top_song_uuids(page, n=max(expect_count + 4, 8))
         # New uuids must be CONTIGUOUS at the top — stop at first old uuid.
         leading_new: list[str] = []
@@ -868,6 +1145,12 @@ def wait_for_generation(
                 "mis-picked row? Double-check before trusting the download.",
                 t, expected_title,
             )
+
+    # Reset the deadline so Phase 2 (rendering completion) gets the FULL
+    # timeout budget regardless of how long Phase 1 (clip insertion) took.
+    # Long songs (5-8 min) need most of this; we don't want Phase 1's settle
+    # time to eat into rendering's window on slow Suno days.
+    deadline = time.time() + timeout_s
 
     # Phase 2: wait for duration labels on those rows.
     last_log = 0.0
@@ -1036,7 +1319,7 @@ def _download_via_ui(
     return None
 
 
-def download_clips(page: Page, clips: list[str], out_dir: Path, base_name: str) -> list[Path]:
+def download_clips(page: Page, clips: list[str], out_dir: Path, base_name: str, file_suffix: str = "") -> list[Path]:
     """Download each clip by uuid. Prefer direct CDN fetch; fall back to UI.
 
     Returns list of written paths (may be shorter than `clips` if a fetch
@@ -1044,8 +1327,9 @@ def download_clips(page: Page, clips: list[str], out_dir: Path, base_name: str) 
     drop the others.)
     """
     out: list[Path] = []
+    sfx = f"_{file_suffix}" if file_suffix else ""
     for i, uuid in enumerate(clips):
-        dest = out_dir / f"{base_name}_{i}_{uuid[:8]}.mp3"
+        dest = out_dir / f"{base_name}_{i}_{uuid[:8]}{sfx}.mp3"
         # Primary: CDN fetch with auth cookies, retrying while partial.
         body = _fetch_with_retry(page, uuid)
         if body is not None and len(body) >= MIN_EXPECTED_MP3_BYTES:
@@ -1074,10 +1358,18 @@ def download_clips(page: Page, clips: list[str], out_dir: Path, base_name: str) 
 # Orchestration
 # -----------------------------------------------------------------------------
 
-def safe_basename(title: str, idx: int) -> str:
+def safe_basename(title: str, n: int) -> str:
+    """Filename stem '<n:04d>_<cleaned_title>' for a row.
+
+    `n` is the CSV's 1-based ordinal — so a 30-row batch produces 0001..0030
+    cleanly. Across CSVs the same `n` may be reused for different titles;
+    that's fine, the title is part of the filename, so distinct songs never
+    collide on disk. The renumber_downloads.py script adds a letter suffix
+    (a, b, …) only when an actual filename collision would overwrite a file.
+    """
     cleaned = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip()
     cleaned = cleaned.replace(" ", "_")[:60] or "song"
-    return f"{idx:04d}_{cleaned}"
+    return f"{n:04d}_{cleaned}"
 
 
 def count_downloaded_files(row: Row, out_dir: Path) -> int:
@@ -1089,7 +1381,7 @@ def count_downloaded_files(row: Row, out_dir: Path) -> int:
     them as done."""
     if not out_dir.exists():
         return 0
-    prefix = safe_basename(row.title, row.index)
+    prefix = safe_basename(row.title, row.n)
     return sum(1 for _ in out_dir.glob(f"{prefix}_*.mp3"))
 
 
@@ -1103,6 +1395,8 @@ def reconcile_status_with_files(
     newly_done = 0
     reset_pending = 0
     for r in rows:
+        if r.status == STATUS_SKIP:
+            continue  # user manually handled — leave it alone, never auto-reset
         have = count_downloaded_files(r, out_dir)
         if have >= expected_per_row:
             if r.status != STATUS_DONE:
@@ -1122,6 +1416,9 @@ def process_row(
     gen_timeout_s: int,
     min_wait_after_click_s: int = DEFAULT_MIN_WAIT_AFTER_CLICK_S,
     style_suffix: str = "",
+    style_suffix_position: str = "after",
+    captcha_wait_s: int = DEFAULT_CAPTCHA_WAIT_S,
+    file_suffix: str = "",
 ) -> list[Path]:
     log.info("  step 1/7: open /create")
     open_create(page)
@@ -1130,10 +1427,12 @@ def process_row(
     log.info("  step 3/7: fill fields")
     effective_styles = row.styles
     if style_suffix:
-        effective_styles = (
-            row.styles.rstrip(", ") + ", " + style_suffix
-            if row.styles else style_suffix
-        )
+        if not row.styles:
+            effective_styles = style_suffix
+        elif style_suffix_position == "before":
+            effective_styles = style_suffix.rstrip(", ") + ", " + row.styles
+        else:
+            effective_styles = row.styles.rstrip(", ") + ", " + style_suffix
     fill_advanced_fields(page, lyrics=row.lyrics, styles=effective_styles, title=row.title)
     log.info("  step 4/7: snapshot workspace TOP (newest-first) before Create")
     _scroll_workspace_to_top(page)
@@ -1146,9 +1445,10 @@ def process_row(
         page, pre_top, gen_timeout_s,
         min_wait_after_click_s=min_wait_after_click_s,
         expected_title=row.title,
+        captcha_wait_s=captcha_wait_s,
     )
     log.info("  step 7/7: download clips")
-    return download_clips(page, clips, out_dir, safe_basename(row.title, row.index))
+    return download_clips(page, clips, out_dir, safe_basename(row.title, row.n), file_suffix=file_suffix)
 
 
 def run_browse(args: argparse.Namespace) -> int:
@@ -1163,7 +1463,7 @@ def run_browse(args: argparse.Namespace) -> int:
         ctx, cleanup = acquire_context(pw, args)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
-            page.goto(CREATE_URL, wait_until="domcontentloaded", timeout=30000)
+            page.goto(CREATE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
         except Exception:
             pass
         log.info("Browser open. Do whatever you need — settings, downloads, etc.")
@@ -1227,11 +1527,16 @@ def run(args: argparse.Namespace) -> int:
 
     # Ask for a styles-suffix (unless user explicitly disabled via --no-ask-suffix).
     style_suffix = args.style_suffix or ""
+    style_suffix_position = args.style_suffix_position
+    # CLI preset wins over the interactive prompt but loses to --style-suffix.
+    if not style_suffix and args.style_suffix_preset == "retro":
+        style_suffix = RETRO_GAME_PRESET
+        style_suffix_position = "before"
     if not args.no_ask_suffix and not style_suffix:
         try:
-            style_suffix = ask_style_suffix_interactively()
+            style_suffix, style_suffix_position = ask_style_suffix_interactively()
         except (EOFError, KeyboardInterrupt):
-            style_suffix = ""
+            style_suffix, style_suffix_position = "", "after"
     if style_suffix:
         # NOTE: we do NOT mutate row.styles. The CSV previously got polluted
         # by doing so: write_rows() runs after each completed row and would
@@ -1239,7 +1544,21 @@ def run(args: argparse.Namespace) -> int:
         # the suffix was effectively appended to the file. Pass style_suffix
         # through to process_row instead and apply it at the moment we type
         # into the Suno Styles textarea.
-        log.info("Will append to every row's styles at generation time: %r", style_suffix)
+        log.info("Will merge %s every row's styles at generation time: %r",
+                 "BEFORE" if style_suffix_position == "before" else "AFTER",
+                 style_suffix)
+
+    # Optional FILENAME suffix (e.g. the Suno version) appended to every saved
+    # file, after the id. Resume/reconcile match the <n>_<title>_ prefix, so a
+    # suffix never causes a regeneration.
+    file_suffix = sanitize_file_suffix(args.file_suffix) if args.file_suffix is not None else ""
+    if args.file_suffix is None and not args.no_ask_suffix:
+        try:
+            file_suffix = ask_file_suffix_interactively()
+        except (EOFError, KeyboardInterrupt):
+            file_suffix = ""
+    if file_suffix:
+        log.info("Will append filename suffix to every saved file: _%s", file_suffix)
 
     # Apply --start / --end ordinal range filter before pending/retry logic.
     if args.start is not None or args.end is not None:
@@ -1288,6 +1607,9 @@ def run(args: argparse.Namespace) -> int:
     with sync_playwright() as pw:
         ctx, cleanup = acquire_context(pw, args)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        configure_timeouts(ctx, page, args.page_timeout)
+        global TTS_ENABLED
+        TTS_ENABLED = not args.no_tts
 
         try:
             # Non-interactive on a real run — force the user to pre-authenticate
@@ -1313,6 +1635,9 @@ def run(args: argparse.Namespace) -> int:
                         page, row, out_dir, args.gen_timeout,
                         min_wait_after_click_s=args.min_wait_after_click,
                         style_suffix=style_suffix,
+                        style_suffix_position=style_suffix_position,
+                        captcha_wait_s=args.captcha_wait,
+                        file_suffix=file_suffix,
                     )
                     row.status = STATUS_DONE
                     log.info("  downloaded %d file(s): %s", len(files), [f.name for f in files])
@@ -1405,10 +1730,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-ask-suffix",
         action="store_true",
-        help="Skip the interactive style-suffix prompt (and don't append anything).",
+        help="Skip the interactive suffix prompts (style AND filename) — append nothing.",
+    )
+    p.add_argument(
+        "--file-suffix",
+        default=None,
+        help="Text appended to every downloaded filename, after the id "
+             "(e.g. the Suno version: 'v5' -> 0001_Title_0_ab12cd34_v5.mp3). "
+             "If omitted (and --no-ask-suffix not set) the script asks "
+             "interactively. Resume/reconcile are unaffected (they match the "
+             "'<n>_<title>_' prefix), so this never causes a regeneration.",
+    )
+    p.add_argument(
+        "--style-suffix-position",
+        choices=("before", "after"),
+        default="after",
+        help="Where to merge --style-suffix relative to the CSV styles "
+             "(default: after). 'before' puts the extra tags FIRST, which "
+             "tends to dominate in Suno; 'after' adds them at the end.",
+    )
+    p.add_argument(
+        "--style-suffix-preset",
+        choices=("none", "retro"),
+        default="none",
+        help="Built-in style-suffix preset. 'retro' = '8-bit music, low frequency "
+             "samples, old computer feel, famicom retro gaming samples' prepended "
+             "(pushes Suno toward game-OST feel, less generic pop).",
     )
     p.add_argument("--out-dir", type=Path, default=DEFAULT_DOWNLOAD_DIR, help="Where to save downloaded audio")
-    p.add_argument("--session-dir", type=Path, default=DEFAULT_SESSION_DIR, help="Playwright user_data_dir")
+    p.add_argument(
+        "--account",
+        default=None,
+        help="Named login profile so several Suno accounts can be stored side by "
+             "side, each its own Chrome profile + saved session (and its own CDP "
+             "port). Omit (or use 'default') for the original profile. Log in once "
+             "per account: --login-only --use-system-chrome --account NAME. Then "
+             "run that account with: --use-system-chrome --account NAME.",
+    )
+    p.add_argument(
+        "--list-accounts",
+        action="store_true",
+        help="List stored account profiles (with their CDP ports) and exit.",
+    )
+    p.add_argument(
+        "--session-dir",
+        type=Path,
+        default=None,
+        help="Playwright user_data_dir. Overrides --account. Default: a per-account "
+             f"dir under {DEFAULT_SESSION_BASE}.",
+    )
     p.add_argument("--delay", type=int, default=DEFAULT_DELAY_S, help="Seconds between generations (default: 30)")
     p.add_argument("--gen-timeout", type=int, default=DEFAULT_GEN_TIMEOUT_S, help="Per-song generation timeout (s)")
     p.add_argument("--headless", action="store_true", help="Run headless (do NOT use for first login)")
@@ -1435,8 +1805,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--cdp-port",
         type=int,
-        default=DEFAULT_CDP_PORT,
-        help=f"DevTools port for --use-system-chrome (default: {DEFAULT_CDP_PORT})",
+        default=None,
+        help=f"DevTools port for --use-system-chrome. Default: {DEFAULT_CDP_PORT} for "
+             f"the 'default' account, or a per-account port (so two accounts can run "
+             f"at the same time without clashing).",
     )
     p.add_argument(
         "--stop-on-error",
@@ -1461,6 +1833,27 @@ def build_parser() -> argparse.ArgumentParser:
              f"racing a workspace that hasn't inserted the new rows yet.",
     )
     p.add_argument(
+        "--page-timeout",
+        type=int,
+        default=DEFAULT_PAGE_TIMEOUT_MS,
+        help=f"Default Playwright action/navigation timeout in ms for a slow Suno "
+             f"UI (default: {DEFAULT_PAGE_TIMEOUT_MS}). Raise if the page lags, or "
+             f"the 'Advanced' tab / Create button time out, e.g. --page-timeout 180000.",
+    )
+    p.add_argument(
+        "--captcha-wait",
+        type=int,
+        default=DEFAULT_CAPTCHA_WAIT_S,
+        help=f"Max seconds to wait for the user to solve a Suno captcha after "
+             f"Create (default: {DEFAULT_CAPTCHA_WAIT_S}). Beyond this the row is failed.",
+    )
+    p.add_argument(
+        "--no-tts",
+        action="store_true",
+        help="Disable spoken TTS alert on captcha detection (terminal beep stays). "
+             "On Windows uses built-in System.Speech; on mac/Linux uses say/spd-say/espeak if present.",
+    )
+    p.add_argument(
         "--browse",
         action="store_true",
         help="Open a browser with the saved Suno session for manual inspection "
@@ -1470,6 +1863,47 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _slug_account(name: Optional[str]) -> str:
+    """Filesystem-safe account id. Empty/None -> 'default'."""
+    s = re.sub(r"[^A-Za-z0-9_-]", "", name or "").strip("-_")
+    return s or "default"
+
+
+def _account_session_dir(account: str) -> Path:
+    """Per-account Chrome profile dir. 'default' keeps the original path."""
+    if account == "default":
+        return DEFAULT_SESSION_DIR
+    return DEFAULT_SESSION_BASE / f"playwright_session_{account}"
+
+
+def _account_port(account: str) -> int:
+    """Deterministic per-account CDP port so two accounts never fight over one."""
+    if account == "default":
+        return DEFAULT_CDP_PORT
+    return DEFAULT_CDP_PORT + (sum(ord(c) for c in account) % 80) + 1
+
+
+def list_accounts() -> int:
+    base = DEFAULT_SESSION_BASE
+    print(f"Session base: {base}")
+    accounts = []
+    if base.is_dir():
+        for d in sorted(base.glob("playwright_session*")):
+            if not d.is_dir():
+                continue
+            name = ("default" if d.name == "playwright_session"
+                    else d.name[len("playwright_session_"):])
+            accounts.append((name, d, (d / "Default").is_dir()))
+    if not accounts:
+        print("  (no accounts yet -- create one with: "
+              "--login-only --use-system-chrome --account NAME)")
+        return 0
+    for name, d, present in accounts:
+        flag = "logged-in" if present else "empty"
+        print(f"  - {name:14s} cdp-port {_account_port(name):5d}  [{flag}]  {d}")
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -1477,6 +1911,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         datefmt="%H:%M:%S",
     )
     args = build_parser().parse_args(argv)
+    if args.list_accounts:
+        return list_accounts()
+    # Resolve the active account into a session dir + CDP port. An explicit
+    # --session-dir / --cdp-port always wins; otherwise both derive from --account.
+    args.account = _slug_account(args.account)
+    if args.session_dir is None:
+        args.session_dir = _account_session_dir(args.account)
+    if args.cdp_port is None:
+        args.cdp_port = _account_port(args.account)
+    log.info("Account '%s'  |  session: %s  |  cdp-port: %d",
+             args.account, args.session_dir, args.cdp_port)
     try:
         if args.browse:
             return run_browse(args)

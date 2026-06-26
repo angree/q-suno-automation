@@ -1,9 +1,20 @@
+# Chrome profiles / saved sessions
 playwright_session/
+playwright_session_*/
+
+# Generated media + run artifacts
 downloads/
+downloads_album*/
+downloads_oceny/
 sorted/
 debug/
-*.tmp
+*.mp3
+
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Misc
+*.tmp
